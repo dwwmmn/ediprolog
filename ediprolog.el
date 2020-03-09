@@ -151,6 +151,10 @@ default Prolog prompt.")
 (defvar ediprolog-interrupted           nil
   "True iff waiting for the previous query was interrupted with C-g.")
 
+(defconst ediprolog-using-windows?
+  (string-equal system-type "windows-nt")
+  "True if we are running on an NT-based OS.")
+
 (defmacro ediprolog-wait-for-prompt-after (&rest forms)
   "Evaluate FORMS and wait for prompt."
   `(progn
@@ -200,6 +204,7 @@ default Prolog prompt.")
       (set var (generate-new-buffer str))
       (with-current-buffer (symbol-value var)
         (buffer-disable-undo)
+;;        (set-buffer-file-coding-system 'utf-8-dos) ; TODO
         (setq buffer-read-only t)))))
 
 (defun ediprolog-log (str &optional col nl)
@@ -230,7 +235,11 @@ default Prolog prompt.")
                              'ediprolog-wait-for-prompt-filter)
          (ediprolog-send-string
           (format "set_prolog_flag(color_term, false),\
-                  '$set_prompt'('%s').\n" ediprolog-prompt)))
+                  '$set_prompt'('%s').\n" ediprolog-prompt))
+         ;; See http://swi-prolog.996271.n3.nabble.com/swipl-and-emacs-ediprolog-hangs-without-prompt-td11683.html
+         (when (ediprolog-using-windows?)
+             (ediprolog-send-string
+              (format "set_stream(user_input, tty(true)),set_stream(user_output, tty(true)).\n" ediprolog-prompt))))
       ((error quit)
        (ediprolog-log "No prompt found." "red" t)
        (error "No prompt from: %s" ediprolog-program)))))
@@ -246,8 +255,9 @@ default Prolog prompt.")
     (let (buffer-read-only)
       (erase-buffer)
       (insert str)
+      (insert "(ediprolog-show-consult-output)\n") ; DEBUG
       (goto-char (point-min))
-      ;; remove normal consult status lines, which start with "%" 
+      ;; remove normal consult status lines, which start with "%"
       (while (re-search-forward "^[\t ]*%.*\n" nil t)
         (delete-region (match-beginning 0) (match-end 0))))
     (setq str (buffer-string)))
@@ -267,7 +277,8 @@ default Prolog prompt.")
   (with-current-buffer (ediprolog-temp-buffer proc)
     (goto-char (point-max))
     (let (buffer-read-only)
-      (insert str))
+      (insert str)
+      (insert "(ediprolog-consult-filter)\n")) ; DEBUG
     (with-current-buffer (process-buffer proc)
       (ediprolog-log str))
     (when (re-search-backward
@@ -479,7 +490,7 @@ operates on the region."
   (set-process-filter ediprolog-process 'ediprolog-consult-filter)
   (ediprolog-remember-interruption
    (ediprolog-wait-for-prompt-after
-    (ediprolog-send-string (format "['%s'].\n" ediprolog-temp-file))))
+    (ediprolog-send-string (format "consult('%s').\n" ediprolog-temp-file))))
   (message "%s consulted." (if (and transient-mark-mode mark-active)
                                "Region" "Buffer"))
   ;; go to line of the first error, if any
