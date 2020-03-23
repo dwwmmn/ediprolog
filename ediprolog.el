@@ -151,9 +151,8 @@ default Prolog prompt.")
 (defvar ediprolog-interrupted           nil
   "True iff waiting for the previous query was interrupted with C-g.")
 
-(defconst ediprolog-using-windows?
-  (string-equal system-type "windows-nt")
-  "True if we are running on an NT-based OS.")
+(defvar ediprolog-guessed-version       nil
+  "What ediprolog has guessed our Prolog distribution is.")
 
 (defmacro ediprolog-wait-for-prompt-after (&rest forms)
   "Evaluate FORMS and wait for prompt."
@@ -180,6 +179,34 @@ default Prolog prompt.")
        ,form
      (quit (setq ediprolog-interrupted t))))
 
+(defun ediprolog-replace-in-buffer (str rep)
+  (save-excursion
+    (goto-char (point-min))
+    (while (re-search-forward str (point-max) t)
+      (replace-match rep))))
+
+(defun ediprolog-using-windows? ()
+  "True if we are running on an NT-based OS."
+  (string-equal system-type "windows-nt"))
+
+(defun ediprolog-guess-version ()
+  "Attempt to determine which Prolog distro is represented in `ediprolog-program'. May not work if not called from `'ediprolog-sentinel'."
+  (save-excursion
+    (point-min)
+    (if (looking-at-p "Welcome to SWI-Prolog")
+        'swipl
+      (if (looking-at-p "[xsb_configuration loaded]")
+          'xsb
+        nil))))
+
+(defun ediprolog-using-xsb? ()
+  (with-current-buffer (process-buffer ediprolog-process)
+    (eq ediprolog-guessed-version 'xsb)))
+
+(defun ediprolog-using-swipl? ()
+  (with-current-buffer (process-buffer ediprolog-process)
+    (eq ediprolog-guessed-version 'swipl)))
+
 ;; Only the sentinel can reliably detect if no more output follows -
 ;; even if process-status is 'exit, further output can still follow.
 (defun ediprolog-sentinel (proc str)
@@ -204,7 +231,6 @@ default Prolog prompt.")
       (set var (generate-new-buffer str))
       (with-current-buffer (symbol-value var)
         (buffer-disable-undo)
-;;        (set-buffer-file-coding-system 'utf-8-dos) ; TODO
         (setq buffer-read-only t)))))
 
 (defun ediprolog-log (str &optional col nl)
@@ -227,19 +253,23 @@ default Prolog prompt.")
                            (substring (current-time-string) 4 -5) args)
                    "green" t)
     (condition-case nil
-        (ediprolog-wait-for-prompt-after
-         (setq ediprolog-process
-               (apply #'start-process "ediprolog" (current-buffer) args))
-         (set-process-sentinel ediprolog-process 'ediprolog-sentinel)
-         (set-process-filter ediprolog-process
-                             'ediprolog-wait-for-prompt-filter)
-         (ediprolog-send-string
-          (format "set_prolog_flag(color_term, false),\
-                  '$set_prompt'('%s').\n" ediprolog-prompt))
-         ;; See http://swi-prolog.996271.n3.nabble.com/swipl-and-emacs-ediprolog-hangs-without-prompt-td11683.html
-         (when (ediprolog-using-windows?)
+        (progn
+          (setq ediprolog-process
+                (apply #'start-process "ediprolog" (current-buffer) args))
+          (set-process-sentinel ediprolog-process 'ediprolog-sentinel)
+          (set-process-filter ediprolog-process
+                              'ediprolog-wait-for-prompt-filter)
+          (sit-for 0.01) ;; TODO
+          (ediprolog-wait-for-prompt-after
+           (when (ediprolog-using-swipl?)
              (ediprolog-send-string
-              (format "set_stream(user_input, tty(true)),set_stream(user_output, tty(true)).\n" ediprolog-prompt))))
+              (format "set_prolog_flag(color_term, false),\
+                '$set_prompt'('%s').\n" ediprolog-prompt))
+
+             ;; See http://swi-prolog.996271.n3.nabble.com/swipl-and-emacs-ediprolog-hangs-without-prompt-td11683.html
+             (when (ediprolog-using-windows?)
+               (ediprolog-send-string
+                (format "set_stream(user_input, tty(true)),set_stream(user_output, tty(true)).\n" ediprolog-prompt))))))
       ((error quit)
        (ediprolog-log "No prompt found." "red" t)
        (error "No prompt from: %s" ediprolog-program)))))
@@ -247,7 +277,8 @@ default Prolog prompt.")
 (defun ediprolog-kill-prolog ()
   "Kill the Prolog process and run the process sentinel."
   (when (ediprolog-running)
-    (delete-process ediprolog-process)))
+    (delete-process ediprolog-process))
+  (setq ediprolog-guessed-version nil))
 
 (defun ediprolog-show-consult-output (str)
   (with-current-buffer (get-buffer-create ediprolog-consult-buffer)
@@ -255,7 +286,8 @@ default Prolog prompt.")
     (let (buffer-read-only)
       (erase-buffer)
       (insert str)
-      (insert "(ediprolog-show-consult-output)\n") ; DEBUG
+      (when (and (ediprolog-using-windows?) (ediprolog-using-xsb?))
+        (ediprolog-replace-in-buffer "\r" ""))
       (goto-char (point-min))
       ;; remove normal consult status lines, which start with "%"
       (while (re-search-forward "^[\t ]*%.*\n" nil t)
@@ -265,7 +297,7 @@ default Prolog prompt.")
   ;; success (i.e., consulted without errors), or still an incomplete
   ;; line that starts with a comment character
   (unless (or (string-match "^[\t ]*\\(?:%.*\\)?\\'" str)
-              (let ((success "true."))
+              (let ((success (if (ediprolog-using-xsb?) "yes" "true.")))
                 (and (<= (length str) (length success))
                      (string= str (substring success 0 (length str))))))
     (setq ediprolog-consult-window (display-buffer ediprolog-consult-buffer))
@@ -278,7 +310,8 @@ default Prolog prompt.")
     (goto-char (point-max))
     (let (buffer-read-only)
       (insert str)
-      (insert "(ediprolog-consult-filter)\n")) ; DEBUG
+      (when (and (ediprolog-using-windows?) (ediprolog-using-xsb?))
+        (ediprolog-replace-in-buffer "\r" "")))
     (with-current-buffer (process-buffer proc)
       (ediprolog-log str))
     (when (re-search-backward
@@ -293,13 +326,19 @@ default Prolog prompt.")
   (with-current-buffer (ediprolog-temp-buffer proc)
     (goto-char (point-max))
     (let (buffer-read-only)
-      (insert str))
+      (insert str)
+      (when (and (ediprolog-using-windows?) (ediprolog-using-xsb?))
+        (ediprolog-replace-in-buffer "\r" "")))
     (with-current-buffer (process-buffer proc)
       (ediprolog-log str))
     (when (re-search-backward
            (format "^%s" (regexp-quote ediprolog-prompt)) nil t)
       (with-current-buffer (process-buffer proc)
-        (setq ediprolog-seen-prompt t)))))
+        (setq ediprolog-seen-prompt t)))
+    (progn
+      (setq ediprolog-guessed-version (ediprolog-guess-version))
+      (when (eq ediprolog-guessed-version nil)
+        (message "Warning: ediprolog can't guess which version of Prolog you are using. This may result in incompatibility issues ")))))
 
 
 ;;;###autoload
@@ -522,7 +561,9 @@ operates on the region."
       (with-current-buffer (ediprolog-temp-buffer proc)
         (goto-char (point-max))
         (let (buffer-read-only)
-          (insert string))
+          (insert string)
+          (when (and (ediprolog-using-windows?) (ediprolog-using-xsb?))
+            (ediprolog-replace-in-buffer "\r" "")))
         (with-current-buffer (process-buffer proc)
           (ediprolog-log string))
         ;; read a term from the user?
@@ -563,6 +604,8 @@ operates on the region."
             ;; precede each line with ediprolog prefices
             (insert str)
             (goto-char (point-min))
+            (when (and (ediprolog-using-windows?) (ediprolog-using-xsb?))
+              (ediprolog-replace-in-buffer "\r" ""))
             (while (search-forward "\n" nil t)
               (replace-match
                (format "\n%s%s" (with-current-buffer (process-buffer proc)
